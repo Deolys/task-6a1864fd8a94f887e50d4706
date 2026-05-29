@@ -1,8 +1,8 @@
 import json
 from typing import TypedDict, List
 from langgraph.graph import StateGraph
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
 
 # Define the state structure
 class PlanningState(TypedDict):
@@ -11,82 +11,116 @@ class PlanningState(TypedDict):
     current_step: int
     results: List[str]
 
-# LLM instance (replace with your own key if needed)
-lm = ChatOpenAI(temperature=0.2, model="gpt-4o-mini")
+# LLM model (ensure OPENAI_API_KEY is set in env)
+llm = ChatOpenAI(temperature=0.2, model="gpt-4o-mini")
 
-# Planning node – split the task into steps
+# Prompt for planning node – ask for numbered list or JSON array
+planning_prompt = PromptTemplate(
+    input_variables=["task"],
+    template=(
+        "You are a helpful assistant that plans how to solve the following task.\n"
+        "Task: {task}\n"
+        "Return only a numbered list of 3-6 concrete steps, or a JSON array named 'plan'. Do not add any extra text."
+    ),
+)
+
+# Planning node function
 async def planning(state: PlanningState) -> PlanningState:
-    prompt = (
-        "You are a helpful assistant that plans how to solve a user query.
-        Given the following task, output a numbered list of 3-6 concrete steps in JSON format with key 'plan'.\n"
-        f"Task: {state['task']}\n"
-        "Example output:\n{"plan": ["Step 1", "Step 2"]}\n"
-    )
-    response = await lm.ainvoke(prompt)
+    task = state["task"]
+    plan_text = await llm.invoke(planning_prompt.format(task=task))
+    # Try to parse JSON first
     try:
-        data = json.loads(response.content.strip())
-        plan = data.get("plan") or []
+        data = json.loads(plan_text.content)
+        if isinstance(data, dict) and "plan" in data:
+            steps = list(map(str.strip, data["plan"]))
+        else:
+            raise ValueError("JSON does not contain 'plan'")
     except Exception:
-        # Fallback: split by lines
-        plan = [line.strip() for line in response.content.splitlines() if line.strip().startswith(\"1.\", \"2.\", \"3.\", \"4.\", \"5.\", \"6.")]
+        # Fallback: parse numbered list
+        lines = plan_text.content.splitlines()
+        steps = []
+        for line in lines:
+            if line.strip():
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    step = parts[1].strip()
+                else:
+                    # try to strip leading number
+                    step = line.lstrip("0123456789.\s-").strip()
+                if step:
+                    steps.append(step)
     return {
-        "task": state["task"],
-        "plan": plan,
+        "task": task,
+        "plan": steps[:6],
         "current_step": 0,
         "results": [],
     }
 
-# Execution node – perform one step and record result
+# Execution node – run one step and record result
+execution_prompt = PromptTemplate(
+    input_variables=["step", "context"],
+    template=(
+        "You are an assistant that executes a single step of a plan.\n"
+        "Step: {step}\n"
+        "Context (previous results): {context}\n"
+        "Return only the result of this step, no extra text."
+    ),
+)
+
 async def execution(state: PlanningState) -> PlanningState:
     idx = state["current_step"]
-    if not state.get("plan") or idx >= len(state["plan"]):
-        return state
+    if idx >= len(state["plan"]):
+        return state  # nothing to do
     step_text = state["plan"][idx]
-    # Ask LLM to produce result for this step
-    prompt = f"You are an assistant. Execute the following step and provide a concise answer:\n{step_text}\nAnswer:"  
-    response = await lm.ainvoke(prompt)
-    result = response.content.strip()
-    new_results = state["results"] + [result]
+    context = "\n---\n".join(state["results"]) if state["results"] else ""
+    result_obj = await llm.invoke(execution_prompt.format(step=step_text, context=context))
+    new_result = result_obj.content.strip()
     return {
-        "task": state["task"],
-        "plan": state["plan"],
+        **state,
         "current_step": idx + 1,
-        "results": new_results,
+        "results": state["results"] + [new_result],
     }
 
 # Condition node – decide whether to continue or finish
-def should_continue(state: PlanningState) -> str:
-    if state.get("current_step", 0) >= len(state.get("plan") or []):
+async def should_continue(state: PlanningState) -> str:
+    if state["current_step"] >= len(state.get("plan", [])):
         return "finish"
     return "execute"
 
 # Build the graph
-builder = StateGraph(PlanningState)
-builder.add_node("planning", planning)
-builder.add_node("execution", execution)
-builder.add_conditional_edges(
+graph = StateGraph(PlanningState)
+graph.add_node("planning", planning)
+graph.add_node("execution", execution)
+graph.add_conditional_edges(
     "planning",
     lambda _: "execute",
 )
-builder.add_edge("execution", "should_continue")
-builder.add_conditional_edges(
+graph.add_edge("execution", "should_continue")
+graph.add_conditional_edges(
     "should_continue",
     should_continue,
-    {"execute": "execution", "finish": "finalize"},
+    {"execute": "execution", "finish": "end"},
 )
-# Final node – combine results
-async def finalize(state: PlanningState) -> str:
-    summary = "\n\nResults:\n" + "\n".join(f"[Шаг {i+1}] {r}" for i, r in enumerate(state["results"]))
-    return f"Task: {state['task']}\n{summary}"
+# Final node – aggregate results
+async def final(state: PlanningState) -> str:
+    return "\n---\n".join(state["results"])
 
-builder.add_node("finalize", finalize)
-builder.set_entry_point("planning")
-builder.set_finish_point("finalize")
+graph.set_entry_point("planning")
+graph.add_node("final", final)
+graph.add_edge("should_continue", "final")  # when finish
 
-graph = builder.compile(checkpointer=MemorySaver())
+# Compile the graph into a runnable chain
+chain = graph.compile()
 
-# Demo execution
+# Demo execution function
+async def run_demo(task_description: str) -> None:
+    print(f"Задача: {task_description}\n")
+    result = await chain.invoke({"task": task_description})
+    # The final node returns a string of all results
+    print("Итог:\n", result)
+
+# If run as script, execute demo with example task
 if __name__ == "__main__":
-    task_description = "Сравни Python и JavaScript"
-    result = graph.invoke({"task": task_description, "plan": None, "current_step": 0, "results": []})
-    print(result)
+    import asyncio
+    example_task = "Сравни Python и JavaScript"
+    asyncio.run(run_demo(example_task))
